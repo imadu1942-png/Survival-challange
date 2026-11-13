@@ -237,7 +237,7 @@ function updateView(dt){
 // ---- Online multiplayer + WebRTC voice (needs server.js; offline mode does not use any of this) ----
 const net={ws:null,id:null,code:null,token:null,room:null,online:false,left:false,alive:{},pt:0,tries:0};
 const ICE=[{urls:'stun:stun.l.google.com:19302'}];
-const voice={on:false,muted:false,stream:null,pcs:{},au:{},an:{},ctx:null};
+const voice={on:false,muted:false,stream:null,pcs:{},au:{},an:{},ctx:null,dbg:{},dead:{},tries:{},early:{}};
 function toast(m){const d=document.createElement('div');d.textContent=m;d.style.cssText='position:fixed;left:50%;top:70px;transform:translateX(-50%);background:#000d;padding:8px 14px;border-radius:12px;font:700 13px system-ui;z-index:99;max-width:86vw;text-align:center';document.body.appendChild(d);setTimeout(()=>d.remove(),3800)}
 function wsSend(o){if(net.ws&&net.ws.readyState===1)net.ws.send(JSON.stringify(o))}
 function ensureAudio(){AC=AC||new (window.AudioContext||window.webkitAudioContext)();AC.resume()}
@@ -265,6 +265,7 @@ function onMsg(m){
   case 'elim':{net.alive[m.id]=false;if(m.id===net.id){if(P.alive)eliminate()}else{const e=players.find(q=>q.id===m.id);if(e){e.alive=false;if(e.target)e.target.alive=false}}break}
   case 'end':onlineEnd(m);break;
   case 'sig':voiceSig(m);break;
+  case 'sigfail':{const d=voice.dbg[m.to];if(d)d.note='signal not delivered ('+m.why+')';break}
   case 'err':toast(m.msg);if(m.fatal)leaveRoom();break;
  }}
 function setRoom(m){
@@ -273,9 +274,9 @@ function setRoom(m){
   net.alive[p.id]=p.alive;
   if(p.id===net.id)return;
   let e=players.find(q=>q.id===p.id);if(!e)e=addRemotePlayer(p.id,p.name,p.color);
-  e.name=p.name;e.color=p.color;e.muted=p.muted;e.voice=p.voice;
+  if(!!e.voice!==!!p.voice)delete voice.dead[p.id];e.name=p.name;e.color=p.color;e.muted=p.muted;e.voice=p.voice;
   if(!net.online)e.alive=true;
-  if(voice.on&&p.voice&&!voice.pcs[p.id]&&net.id<p.id)callPeer(p.id);   // lower id always makes the call
+  if(voice.on&&p.voice&&!voice.pcs[p.id]&&!voice.dead[p.id]&&net.id<p.id)callPeer(p.id);   // lower id always makes the call
   if(!p.voice&&voice.pcs[p.id])closePeer(p.id);
  });
  players.filter(q=>!q.isMe&&!ids.has(q.id)).forEach(q=>{closePeer(q.id);removeRemotePlayer(q.id)});
@@ -353,7 +354,7 @@ async function voiceOn(){
  if(!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia){toast('Microphone is not available here (needs https)');return}
  try{voice.stream=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true,noiseSuppression:true}})}
  catch(e){toast(e.name==='NotAllowedError'?'Microphone permission was denied':'No microphone found');return}
- voice.on=true;voice.muted=false;watch(net.id,voice.stream);
+ voice.on=true;voice.muted=false;voice.dead={};voice.tries={};watch(net.id,voice.stream);
  wsSend({t:'voice',on:true,muted:false});
  net.room.players.forEach(p=>{if(p.id!==net.id&&p.voice&&net.id<p.id)callPeer(p.id)});
  setMicLabel();updateMics();
@@ -365,44 +366,130 @@ function voiceMute(){
 function voiceOff(){
  if(!voice.on)return;voice.on=false;voice.muted=false;
  voice.stream.getTracks().forEach(t=>t.stop());voice.stream=null;
- Object.keys(voice.pcs).forEach(closePeer);delete voice.an[net.id];
+ Object.keys(voice.pcs).forEach(id=>closePeer(id));voice.dead={};voice.tries={};voice.early={};delete voice.an[net.id];
  wsSend({t:'voice',on:false,muted:false});setMicLabel();
 }
 function watch(id,stream){
  if(!voice.ctx)voice.ctx=new (window.AudioContext||window.webkitAudioContext)();voice.ctx.resume();
  const an=voice.ctx.createAnalyser();an.fftSize=256;voice.ctx.createMediaStreamSource(stream).connect(an);voice.an[id]=an;
 }
+const MAXTRY=4;
+function peerName(id){const p=net.room&&net.room.players.find(q=>q.id===id);return p?p.name:String(id).slice(0,4)}
+function peerWantsVoice(id){const p=net.room&&net.room.players.find(q=>q.id===id);return !!(p&&p.voice)}
 function mkPc(id){
  const pc=new RTCPeerConnection({iceServers:ICE});voice.pcs[id]=pc;pc.q=[];
+ const old=voice.dbg[id]||{};
+ const d=voice.dbg[id]={t0:Date.now(),sig:'new',ice:'new',conn:'new',track:false,rx:0,last:0,lastT:Date.now(),route:'',note:old.note||'',cand:{host:0,srflx:0,relay:0}};
+ const live=()=>voice.pcs[id]===pc;
  voice.stream.getTracks().forEach(t=>pc.addTrack(t,voice.stream));
- pc.onicecandidate=e=>{if(e.candidate)wsSend({t:'sig',to:id,data:{c:e.candidate}})};
- pc.ontrack=e=>{let a=voice.au[id];if(!a){a=document.createElement('audio');a.autoplay=true;a.playsInline=true;document.body.appendChild(a);voice.au[id]=a}
+ pc.onicecandidate=e=>{if(!e.candidate||!live())return;
+  const m=/ typ (\w+)/.exec(e.candidate.candidate||'');if(m&&d.cand[m[1]]!==undefined)d.cand[m[1]]++;
+  wsSend({t:'sig',to:id,data:{c:e.candidate}})};
+ pc.ontrack=e=>{if(!live())return;d.track=true;let a=voice.au[id];if(!a){a=document.createElement('audio');a.autoplay=true;a.playsInline=true;document.body.appendChild(a);voice.au[id]=a}
   a.srcObject=e.streams[0];a.volume=settings.voice;a.play().catch(()=>{});watch(id,e.streams[0])};
- pc.onconnectionstatechange=()=>{if(pc.connectionState==='failed'){toast('Voice link to a player failed (network may block it)');closePeer(id)}};
+ pc.onsignalingstatechange=()=>{if(live())d.sig=pc.signalingState};
+ pc.oniceconnectionstatechange=()=>{if(live())d.ice=pc.iceConnectionState};
+ pc.onconnectionstatechange=()=>{
+  if(!live())return;d.conn=pc.connectionState;
+  if(pc.connectionState==='connected'){clearTimeout(d.timer);clearTimeout(d.dtimer);voice.tries[id]=0;d.note='';d.lastT=Date.now()}
+  else if(pc.connectionState==='failed')retryPeer(id,'connection failed',pc);
+  else if(pc.connectionState==='disconnected'){clearTimeout(d.dtimer);d.dtimer=setTimeout(()=>{if(live()&&pc.connectionState!=='connected')retryPeer(id,'link dropped',pc)},4000)}};
+ d.timer=setTimeout(()=>{if(live()&&pc.connectionState!=='connected')retryPeer(id,'no connection after 12 s',pc)},12000);
  return pc;
 }
+// Automatic recovery: close the stuck link and start a new one (up to MAXTRY times, with backoff).
+// The lower-id player always makes the call; the other side asks it to retry through the server.
+function retryPeer(id,why,pc){
+ if(pc&&voice.pcs[id]!==pc)return;                       // ignore events from an old, already replaced link
+ const n=voice.tries[id]=(voice.tries[id]||0)+1,d=voice.dbg[id];
+ if(d)d.note='retry '+n+'/'+MAXTRY+': '+why;
+ closePeer(id,true);
+ if(n>MAXTRY){voice.dead[id]=true;if(d)d.note='gave up: '+why;toast('Voice link to '+peerName(id)+' failed after '+MAXTRY+' tries. This network may need a relay server (TURN).');return}
+ if(!voice.on)return;
+ if(net.id<id)setTimeout(()=>{if(voice.on&&!voice.pcs[id]&&!voice.dead[id]&&peerWantsVoice(id))callPeer(id)},500*n);
+ else wsSend({t:'sig',to:id,data:{r:1}});
+}
 async function callPeer(id){
- try{const pc=mkPc(id),o=await pc.createOffer();await pc.setLocalDescription(o);wsSend({t:'sig',to:id,data:{d:pc.localDescription}})}catch(e){closePeer(id)}
+ if(voice.pcs[id]||!voice.on)return;
+ try{const pc=mkPc(id),o=await pc.createOffer();await pc.setLocalDescription(o);wsSend({t:'sig',to:id,data:{d:pc.localDescription}})}
+ catch(e){retryPeer(id,'offer error: '+(e&&e.message||e))}
 }
 async function voiceSig(m){
- if(!voice.on)return;const d=m.data||{};let pc=voice.pcs[m.from];
+ const d=m.data||{};
+ if(d.nm){if(net.id<m.from)retryPeer(m.from,'other player mic not ready');return}
+ if(!voice.on){if(d.d&&d.d.type==='offer')wsSend({t:'sig',to:m.from,data:{nm:1}});return}
+ let pc=voice.pcs[m.from];
+ if(d.r){
+  if(net.id<m.from){const x=voice.dbg[m.from];if(pc&&x&&Date.now()-x.t0<3000)return;if(!voice.dead[m.from]){closePeer(m.from,true);callPeer(m.from)}}
+  return}
  try{
   if(d.d){
    if(d.d.type==='offer'){
-    if(pc)closePeer(m.from);pc=mkPc(m.from);
+    if(pc)closePeer(m.from,true);
+    pc=mkPc(m.from);
+    await pc.setRemoteDescription(d.d);
+    pc.q.push(...(voice.early[m.from]||[]));delete voice.early[m.from];
+    for(const c of pc.q.splice(0))await pc.addIceCandidate(c).catch(()=>{});
+    const a=await pc.createAnswer();await pc.setLocalDescription(a);
+    wsSend({t:'sig',to:m.from,data:{d:pc.localDescription}});
+   }else if(pc&&pc.signalingState==='have-local-offer'){
     await pc.setRemoteDescription(d.d);for(const c of pc.q.splice(0))await pc.addIceCandidate(c).catch(()=>{});
-    const a=await pc.createAnswer();await pc.setLocalDescription(a);wsSend({t:'sig',to:m.from,data:{d:pc.localDescription}});
-   }else if(pc){await pc.setRemoteDescription(d.d);for(const c of pc.q.splice(0))await pc.addIceCandidate(c).catch(()=>{})}
-  }else if(d.c&&pc){
-   if(pc.remoteDescription)await pc.addIceCandidate(d.c).catch(()=>{});else pc.q.push(d.c);
+   }
+  }else if(d.c){
+   if(pc&&pc.remoteDescription)await pc.addIceCandidate(d.c).catch(()=>{});
+   else if(pc)pc.q.push(d.c);
+   else{const e=voice.early[m.from]=voice.early[m.from]||[];if(e.length<30)e.push(d.c)}   // candidate arrived before its offer
   }
- }catch(e){closePeer(m.from)}
+ }catch(e){retryPeer(m.from,'signaling error: '+(e&&e.message||e),pc)}
 }
-function closePeer(id){
- const pc=voice.pcs[id];if(pc)pc.close();delete voice.pcs[id];
+function closePeer(id,keep){
+ const pc=voice.pcs[id],d=voice.dbg[id];
+ if(d){clearTimeout(d.timer);clearTimeout(d.dtimer)}
+ if(pc){pc.onconnectionstatechange=null;pc.onicecandidate=null;try{pc.close()}catch(e){}}
+ delete voice.pcs[id];
  const a=voice.au[id];if(a){a.srcObject=null;a.remove();delete voice.au[id]}
  delete voice.an[id];
+ if(!keep)delete voice.dbg[id];
 }
+// ---- voice diagnostics (small status line at the bottom of the screen while in a room) ----
+let polling=false;
+async function pollStats(){
+ if(polling)return;polling=true;
+ for(const id in voice.pcs){
+  const pc=voice.pcs[id],d=voice.dbg[id];if(!d)continue;
+  try{
+   const st=await pc.getStats();let sel=null,rx=0;
+   st.forEach(r=>{
+    if(r.type==='candidate-pair'&&r.state==='succeeded'&&(r.nominated||r.selected))sel=r;
+    if(r.type==='inbound-rtp'&&(r.kind==='audio'||r.mediaType==='audio'))rx=r.bytesReceived||0});
+   if(rx>d.rx)d.lastT=Date.now();d.rx=rx;
+   if(sel){const l=st.get(sel.localCandidateId),q=st.get(sel.remoteCandidateId);d.route=((l&&l.candidateType)||'?')+'<>'+((q&&q.candidateType)||'?')}
+   if(pc.connectionState==='connected'&&d.track&&Date.now()-d.lastT>10000&&!/retry|gave/.test(d.note))d.note='connected but no audio data for 10 s'
+  }catch(e){}}
+ polling=false;
+}
+function renderVdbg(){
+ let el=$('vdbg');
+ if(!net.code){if(el)el.style.display='none';return}
+ if(!el){el=document.createElement('div');el.id='vdbg';
+  el.style.cssText='position:fixed;left:50%;transform:translateX(-50%);bottom:calc(env(safe-area-inset-bottom,0px) + 4px);z-index:6;max-width:94vw;font:600 10px/1.35 system-ui;background:#000b;color:#cfe;padding:3px 8px;border-radius:8px;pointer-events:none;text-align:center;white-space:pre-line';
+  document.body.appendChild(el)}
+ el.style.display=phase==='result'?'none':'block';
+ let t='Voice: '+(!voice.on?'your mic is off':voice.muted?'your mic is muted':'your mic is on');
+ (net.room?net.room.players:[]).forEach(p=>{
+  if(p.id===net.id)return;
+  const d=voice.dbg[p.id];let s;
+  if(!p.voice)s='mic off';
+  else if(voice.dead[p.id])s='FAILED after '+MAXTRY+' tries ('+((d&&d.note)||'no route')+')';
+  else if(!voice.on)s='waiting for your mic';
+  else if(!d)s='connecting…';
+  else{const c=d.cand;
+   s=d.conn+' | ice '+d.ice+' | audio '+(d.rx>0?'flowing '+Math.round(d.rx/1024)+' KB':d.track?'track, no data':'none')
+    +' | route '+(d.route||'-')+' | found host '+c.host+' stun '+c.srflx+' relay '+c.relay+(c.srflx?'':' (no STUN reply)')+(d.note?' | '+d.note:'')}
+  t+='\n'+p.name+': '+s});
+ el.textContent=t;
+}
+setInterval(()=>{pollStats();renderVdbg()},700);
 setInterval(()=>{
  if(!voice.ctx)return;const b=new Uint8Array(128);let ch=false;
  for(const id in voice.an){

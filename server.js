@@ -13,7 +13,7 @@ const server = http.createServer((req, res) => {
   res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-cache' });
   res.end(html);
 });
-const wss = new WebSocketServer({ server, maxPayload: 4096 });
+const wss = new WebSocketServer({ server, maxPayload: 16384 });
 const rooms = new Map();
 
 const send = (ws, o) => { if (ws && ws.readyState === 1) ws.send(JSON.stringify(o)); };
@@ -162,7 +162,10 @@ wss.on('connection', ws => {
       case 'sig': {
         if (!me) break;
         const to = room.players.get(m.to);
-        if (to && JSON.stringify(m.data || {}).length < 3500) send(to.ws, { t: 'sig', from: me.id, data: m.data });
+        const size = JSON.stringify(m.data || {}).length;
+        if (size > 12000) { err('Voice setup message too large (' + size + ' chars) and was dropped'); break; }
+        if (!to || !to.ws) { send(ws, { t: 'sigfail', to: m.to, why: 'player offline' }); break; }
+        send(to.ws, { t: 'sig', from: me.id, data: m.data });
         break;
       }
       case 'lobby':
